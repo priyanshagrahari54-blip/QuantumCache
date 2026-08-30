@@ -1723,10 +1723,11 @@ private:
 
     void StartBackgroundFlushThreadIfConfigured() {
         if (options_.flushPolicy != FlushPolicyKind::PeriodicBackground) return;
+        std::lock_guard<std::mutex> lock(backgroundFlushMutex_);
         if (backgroundFlushThread_.joinable()) return; // already running; do not start twice
+        backgroundFlushStopRequested_ = false;
 
         std::uint32_t intervalSeconds = std::max<std::uint32_t>(1, options_.flushIntervalSeconds);
-        backgroundFlushStopRequested_ = false;
 
         backgroundFlushThread_ = std::thread([this, intervalSeconds]() {
             std::unique_lock<std::mutex> lock(backgroundFlushMutex_);

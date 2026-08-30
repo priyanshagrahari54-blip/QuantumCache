@@ -244,7 +244,7 @@ Result<InvalidateKeyRequestPayload> MessageCodec::DecodeInvalidateKeyRequest(con
     if (!headerCheck) return Result<InvalidateKeyRequestPayload>::Failure(headerCheck.Err());
 
     InvalidateKeyRequestPayload payload;
-    if (!ReadString(frame, offset, payload.key)) {
+    if (!ReadString(frame, offset, payload.key, 16u * 1024u * 1024u)) {
         return Result<InvalidateKeyRequestPayload>::Failure(
             Error{ErrorCode::CorruptData, "IPC frame truncated invalidate-key payload", 0});
     }
