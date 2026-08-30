@@ -1749,6 +1749,8 @@ private:
                 // "never hold a lock across I/O" discipline described in
                 // the file-header CONCURRENCY MODEL comment.
                 lock.unlock();
+                // Check engine lifecycle readiness before invoking FlushAll().
+                // Only flush if the engine is currently in EngineLifecycle::Ready state.
                 auto lifecycleNow = lifecycle_.load();
                 if (lifecycleNow == EngineLifecycle::Ready) {
                     auto flushResult = FlushAll();
