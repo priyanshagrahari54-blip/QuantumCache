@@ -112,7 +112,10 @@ void AppendHeaderPlaceholder(std::vector<std::uint8_t>& frame, MessageType type)
 
 void PatchLength(std::vector<std::uint8_t>& frame) {
     std::uint32_t totalLength = static_cast<std::uint32_t>(frame.size());
-    std::memcpy(frame.data(), &totalLength, sizeof(totalLength));
+    if (frame.size() >= sizeof(totalLength)) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(&totalLength);
+        std::copy(bytes, bytes + sizeof(totalLength), frame.begin());
+    }
 }
 
 void AppendString(std::vector<std::uint8_t>& frame, const std::string& s) {
@@ -222,7 +225,7 @@ Result<OperationResultPayload> MessageCodec::DecodeOperationResult(const std::ve
     OperationResultPayload payload;
     std::uint8_t succeededByte = 0;
     if (!ReadRaw(frame, offset, succeededByte) || !ReadRaw(frame, offset, payload.errorCode) ||
-        !ReadString(frame, offset, payload.message)) {
+        !ReadString(frame, offset, payload.message, 64u * 1024u)) {
         return Result<OperationResultPayload>::Failure(
             Error{ErrorCode::CorruptData, "IPC frame truncated operation-result payload", 0});
     }
@@ -241,12 +244,15 @@ std::vector<std::uint8_t> MessageCodec::EncodeInvalidateKeyRequest(const Invalid
 Result<InvalidateKeyRequestPayload> MessageCodec::DecodeInvalidateKeyRequest(const std::vector<std::uint8_t>& frame) {
     std::size_t offset = 0;
     auto headerCheck = CheckHeader(frame, offset, MessageType::InvalidateKeyRequest);
-    if (!headerCheck) return Result<InvalidateKeyRequestPayload>::Failure(headerCheck.Err());
+    if (!headerCheck) {
+        return Result<InvalidateKeyRequestPayload>::Failure(
+            Error{headerCheck.Err().code, "Header check failed: " + headerCheck.Err().message, 0});
+    }
 
     InvalidateKeyRequestPayload payload;
-    if (!ReadString(frame, offset, payload.key)) {
+    if (!ReadString(frame, offset, payload.key, 16u * 1024u * 1024u)) {
         return Result<InvalidateKeyRequestPayload>::Failure(
-            Error{ErrorCode::CorruptData, "IPC frame truncated invalidate-key payload", 0});
+            Error{ErrorCode::CorruptData, "IPC frame truncated invalidate-key payload: size=" + std::to_string(frame.size()) + " offset=" + std::to_string(offset), 0});
     }
     return Result<InvalidateKeyRequestPayload>::Success(payload);
 }
