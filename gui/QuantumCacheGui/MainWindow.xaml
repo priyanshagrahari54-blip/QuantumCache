@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="QuantumCacheGui.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <!--
+      Stage 1 GUI scope: display real service/recovery status only.
+      There is intentionally no cache statistics, hit-rate, or
+      configuration-of-cache-behavior UI here yet, since that engine does
+      not exist. The one thing this window MUST surface, per the Stage 1
+      power-loss requirement, is whether the last shutdown was clean or
+      whether the service is currently recovering from an unexpected
+      power loss.
+    -->
+    <Grid Padding="24" RowSpacing="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0"
+                   Text="QuantumCache"
+                   FontSize="28"
+                   FontWeight="SemiBold" />
+
+        <TextBlock Grid.Row="1"
+                   Text="Stage 1 — project foundation. No caching is active yet."
+                   Opacity="0.7" />
+
+        <Border Grid.Row="2"
+                Padding="16"
+                CornerRadius="8"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+            <StackPanel Spacing="4">
+                <TextBlock Text="Power / Recovery Status" FontWeight="SemiBold" />
+                <TextBlock x:Name="RecoveryStateText" Text="Unknown (service not queried yet)" />
+                <TextBlock x:Name="SessionGenerationText" Text="Session generation: —" Opacity="0.7" FontSize="12" />
+                <Button x:Name="RefreshButton"
+                        Content="Refresh status"
+                        Click="OnRefreshClicked"
+                        Margin="0,8,0,0" />
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>
