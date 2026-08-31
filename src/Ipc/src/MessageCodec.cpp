@@ -121,7 +121,7 @@ void AppendString(std::vector<std::uint8_t>& frame, const std::string& s) {
 }
 
 bool ReadString(const std::vector<std::uint8_t>& frame, std::size_t& offset, std::string& out,
-                std::uint32_t maxAllowedLength = 64u * 1024u) {
+                std::uint32_t maxAllowedLength = 16u * 1024u * 1024u) {
     std::uint32_t length = 0;
     if (!ReadRaw(frame, offset, length)) return false;
     // Sanity bound to prevent memory exhaustion / DoS attacks from untrusted IPC input.

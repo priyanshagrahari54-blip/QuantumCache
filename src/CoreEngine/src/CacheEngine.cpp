@@ -687,48 +687,114 @@ public:
         auto readyCheck = CheckReadyForRead();
         if (!readyCheck) return Result<void>::Failure(readyCheck.Err());
 
+        constexpr std::size_t kBatchSize = 100000;
         Error lastError;
         bool anyFailed = false;
 
-        for (auto& shard : shards_) {
-            std::vector<std::string> dirtyKeys;
-            {
+        while (true) {
+            struct FlushItem {
+                std::string key;
+                std::vector<std::uint8_t> value;
+                std::uint64_t version;
+            };
+            std::vector<FlushItem> batch;
+            batch.reserve(kBatchSize);
+
+            for (auto& shard : shards_) {
+                if (batch.size() >= kBatchSize) break;
                 std::lock_guard<std::mutex> lock(shard.mutex);
-                dirtyKeys.reserve(shard.dirtyCount);
                 for (auto& entry : shard.lru) {
                     if (entry.dirtyState == EntryDirtyState::Dirty) {
-                        dirtyKeys.push_back(entry.key);
+                        entry.dirtyState = EntryDirtyState::FlushInProgress;
+                        batch.push_back({entry.key, entry.value, entry.version});
+                        if (batch.size() >= kBatchSize) break;
                     }
                 }
             }
 
-            for (auto& key : dirtyKeys) {
-                auto result = FlushKey(key, 0, /*checkVersion=*/false);
-                if (!result) {
-                    anyFailed = true;
-                    lastError = result.Err();
-                    if (logger_) {
-                        logger_->Log(Logging::LogLevel::Error, "CoreEngine",
-                                     "FlushAll: failed to flush key '" + key + "': " + result.Err().message);
-                    }
+            if (batch.empty()) break;
+
+            std::vector<CacheJournalRecord> intentRecords;
+            intentRecords.reserve(batch.size());
+            std::vector<Storage::IBackingStore::BatchItem> backingItems;
+            backingItems.reserve(batch.size());
+            std::vector<CacheJournalRecord> completeRecords;
+            completeRecords.reserve(batch.size());
+
+            for (const auto& item : batch) {
+                CacheJournalRecord intent;
+                intent.type = CacheRecordType::FlushIntent;
+                intent.key = item.key;
+                intent.entryVersion = item.version;
+                intentRecords.push_back(intent);
+
+                backingItems.push_back({item.key, item.value});
+
+                CacheJournalRecord complete;
+                complete.type = CacheRecordType::FlushComplete;
+                complete.key = item.key;
+                complete.entryVersion = item.version;
+                completeRecords.push_back(complete);
+            }
+
+            auto intentRes = AppendJournalRecordsBatch(intentRecords);
+            if (!intentRes) {
+                anyFailed = true;
+                lastError = intentRes.Err();
+                for (const auto& item : batch) {
+                    Shard& shard = ShardFor(item.key);
+                    std::lock_guard<std::mutex> lock(shard.mutex);
+                    RevertFlushInProgressLocked(shard, item.key, item.version);
+                }
+                flushFailureCount_.fetch_add(batch.size(), std::memory_order_relaxed);
+                break;
+            }
+
+            auto putRes = backingStore_->PutBatch(backingItems);
+            if (!putRes) {
+                anyFailed = true;
+                lastError = putRes.Err();
+                for (const auto& item : batch) {
+                    Shard& shard = ShardFor(item.key);
+                    std::lock_guard<std::mutex> lock(shard.mutex);
+                    RevertFlushInProgressLocked(shard, item.key, item.version);
+                }
+                flushFailureCount_.fetch_add(batch.size(), std::memory_order_relaxed);
+                break;
+            }
+
+            auto completeRes = AppendJournalRecordsBatch(completeRecords);
+            if (!completeRes) {
+                anyFailed = true;
+                lastError = completeRes.Err();
+                for (const auto& item : batch) {
+                    Shard& shard = ShardFor(item.key);
+                    std::lock_guard<std::mutex> lock(shard.mutex);
+                    RevertFlushInProgressLocked(shard, item.key, item.version);
+                }
+                flushFailureCount_.fetch_add(batch.size(), std::memory_order_relaxed);
+                break;
+            }
+
+            for (const auto& item : batch) {
+                Shard& shard = ShardFor(item.key);
+                std::lock_guard<std::mutex> lock(shard.mutex);
+                auto it = shard.index.find(item.key);
+                if (it != shard.index.end() && it->second->version == item.version &&
+                    it->second->dirtyState == EntryDirtyState::FlushInProgress) {
+                    std::size_t sizeBytes = it->second->SizeBytes();
+                    it->second->dirtyState = EntryDirtyState::Clean;
+                    shard.dirtyBytes -= sizeBytes;
+                    --shard.dirtyCount;
                 }
             }
+            flushSuccessCount_.fetch_add(batch.size(), std::memory_order_relaxed);
         }
 
         if (anyFailed) {
             return Result<void>::Failure(lastError);
         }
 
-        // Priority 2.7 (journal growth/compaction): opportunistically
-        // attempt to reclaim journal space now that every dirty entry
-        // this FlushAll() found has been successfully flushed. This is
-        // the ONLY place besides Shutdown() the journal is ever
-        // truncated — see TryCompactJournalIfFullyClean()'s full
-        // rationale. Deliberately unconditional (not gated behind any
-        // "only if it's been a while" heuristic) because the check
-        // itself is cheap (a handful of already-necessary shard-lock
-        // acquisitions) and TryCompactJournalIfFullyClean() itself is a
-        // correct no-op whenever anything is still dirty.
         TryCompactJournalIfFullyClean();
         return Result<void>::Success();
     }
@@ -878,6 +944,21 @@ private:
         if (state == EngineLifecycle::Stopped) {
             return Result<void>::Failure(Error{
                 ErrorCode::ServiceStopping, "cache engine has finished shutting down", 0});
+        }
+        return Result<void>::Success();
+    }
+
+    [[nodiscard]] Result<void> AppendJournalRecordsBatch(const std::vector<CacheJournalRecord>& records) {
+        if (records.empty()) return Result<void>::Success();
+        std::vector<std::vector<std::uint8_t>> encodedBatch;
+        encodedBatch.reserve(records.size());
+        for (const auto& record : records) {
+            encodedBatch.push_back(JournalRecordCodec::Encode(record));
+        }
+        std::lock_guard<std::mutex> lock(journalMutex_);
+        auto appendResult = journal_->AppendBatch(encodedBatch);
+        if (!appendResult) {
+            return Result<void>::Failure(appendResult.Err());
         }
         return Result<void>::Success();
     }
