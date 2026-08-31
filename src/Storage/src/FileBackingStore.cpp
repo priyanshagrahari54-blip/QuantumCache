@@ -1,35 +1,39 @@
-// Real, working file-backed key/value store used as the Stage 2 backing
-// store CacheEngine caches in front of. Built entirely on IFile (works
-// against both Win32File and PortableFile — no platform-specific code
-// here), so it inherits IFile's existing crash-consistency behavior
-// rather than inventing a second one.
+// Clean, redesign of FileBackingStore using a Transactional Batch Durability Protocol.
 //
-// On-disk record framing (append-only log, same shape of reasoning as
-// PowerResilience's write-ahead journal, deliberately reusing the pattern
-// rather than a third bespoke format):
-//   uint32_t magic        = 0x51434253 ('Q','C','B','S')
-//   uint64_t sequence
-//   uint8_t  tombstone     (0 = value present, 1 = key removed)
-//   uint32_t keyLength
-//   uint8_t  key[keyLength]
-//   uint32_t valueLength   (0 when tombstone == 1)
-//   uint8_t  value[valueLength]
-//   uint32_t crc32         (over every byte above, this record only)
+// On-disk record framing (batch-oriented, durable commit boundary):
 //
-// Startup behavior: OpenFileBackingStore scans the whole file sequentially
-// (exactly like IWriteAheadJournal::Replay), building an in-memory index
-// of "latest record offset per key". If a torn/corrupt record is found
-// (CRC mismatch, truncated read — the expected shape of a power cut
-// mid-append), the scan stops there and the file is immediately
-// SetLength()-truncated to the end of the last valid record and durably
-// flushed, so the torn garbage can never be misread later and new writes
-// land at a clean append point.
+//  Batch Header:
+//    uint32_t batchMagic     = 0x51434248 ('Q','C','B','H')
+//    uint64_t batchId
+//    uint32_t recordCount
+//
+//  Per Record (1..recordCount):
+//    uint64_t version
+//    uint8_t  tombstone       (0 = value present, 1 = key removed)
+//    uint32_t keyLength
+//    uint8_t  key[keyLength]
+//    uint32_t valueLength     (0 when tombstone == 1)
+//    uint8_t  value[valueLength]
+//
+//  Batch Commit Marker:
+//    uint32_t commitMagic    = 0x51434243 ('Q','C','B','C')
+//    uint64_t batchId        (must match header batchId)
+//    uint32_t crc32          (computed over batch header + all records + commit magic + batchId)
+//
+// Startup behavior:
+//   OpenFileBackingStore scans the file sequentially batch by batch.
+//   A batch is valid ONLY if its header, all records, commit marker, and CRC match.
+//   If an uncommitted or torn batch is encountered (CRC mismatch, missing commit marker, short read),
+//   the scan stops immediately and the file is SetLength()-truncated to the end of the last
+//   valid committed batch and durably flushed.
+//   In-memory index is updated only for committed batches using strict version ordering (newer or equal version wins).
+
 #include "QuantumCache/Storage/IBackingStore.h"
 #include "QuantumCache/Storage/IFile.h"
 #include "QuantumCache/Common/Crc32.h"
+#include <algorithm>
 #include <cstring>
 #include <mutex>
-#include <optional>
 #include <unordered_map>
 
 namespace QuantumCache::Storage {
@@ -40,24 +44,14 @@ using Common::Error;
 using Common::ErrorCode;
 using Common::Result;
 
-constexpr std::uint32_t kMagic = 0x51434253u; // "QCBS"
-
-// AUDITED BUG (fixed): Initialize()'s startup scan used to allocate
-// std::vector<std::uint8_t> keyBytes(keyLength) / valueBytes(valueLength)
-// directly from uint32_t length fields read straight off disk, with NO
-// sanity bound — the same class of issue fixed in
-// WriteAheadJournal::Replay() (see that file's kMaxReasonablePayloadLength
-// comment for the full rationale). A single corrupted length byte in the
-// backing-store file (again, exactly the kind of damage a torn write or
-// bad sector causes) could request a multi-gigabyte allocation during
-// startup, causing an uncaught std::bad_alloc/OOM crash instead of the
-// intended "stop scan, treat as torn tail" behavior every other
-// corruption case in this same loop already gets.
+constexpr std::uint32_t kBatchHeaderMagic = 0x51434248u; // "QCBH"
+constexpr std::uint32_t kBatchCommitMagic = 0x51434243u; // "QCBC"
 constexpr std::uint32_t kMaxReasonableLength = 256u * 1024u * 1024u;
 
 struct IndexEntry {
     std::uint64_t recordOffset{0};
     bool tombstone{false};
+    std::uint64_t version{0};
 };
 
 template <typename T>
@@ -73,69 +67,134 @@ public:
     Result<void> Initialize() {
         std::uint64_t offset = 0;
         std::uint64_t validEnd = 0;
-        std::uint64_t maxSequence = 0;
+        std::uint64_t maxBatchId = 0;
+        std::uint64_t maxVersion = 0;
 
         auto seekResult = file_->Seek(0, false);
         if (!seekResult) return Result<void>::Failure(seekResult.Err());
 
         for (;;) {
-            std::uint32_t magic = 0;
-            if (!ReadExact(&magic, sizeof(magic))) break;
-            if (magic != kMagic) break;
+            std::uint64_t batchStartOffset = offset;
+            std::uint32_t headerMagic = 0;
+            if (!ReadExact(&headerMagic, sizeof(headerMagic))) break;
+            if (headerMagic != kBatchHeaderMagic) break;
 
-            std::uint64_t sequence = 0;
-            std::uint8_t tombstone = 0;
-            std::uint32_t keyLength = 0;
-            if (!ReadExact(&sequence, sizeof(sequence))) break;
-            if (!ReadExact(&tombstone, sizeof(tombstone))) break;
-            if (!ReadExact(&keyLength, sizeof(keyLength))) break;
-            // AUDITED BUG (fixed): bound-check BEFORE allocating — see
-            // kMaxReasonableLength's comment above.
-            if (keyLength > kMaxReasonableLength) break;
+            std::uint64_t batchId = 0;
+            std::uint32_t recordCount = 0;
+            if (!ReadExact(&batchId, sizeof(batchId))) break;
+            if (!ReadExact(&recordCount, sizeof(recordCount))) break;
 
-            std::vector<std::uint8_t> keyBytes(keyLength);
-            if (keyLength > 0 && !ReadExact(keyBytes.data(), keyLength)) break;
+            std::vector<std::uint8_t> batchDataForCrc;
+            AppendRaw(batchDataForCrc, headerMagic);
+            AppendRaw(batchDataForCrc, batchId);
+            AppendRaw(batchDataForCrc, recordCount);
 
-            std::uint32_t valueLength = 0;
-            if (!ReadExact(&valueLength, sizeof(valueLength))) break;
-            if (valueLength > kMaxReasonableLength) break;
+            struct ScannedRecord {
+                std::string key;
+                std::uint64_t recordOffset;
+                bool tombstone;
+                std::uint64_t version;
+            };
+            std::vector<ScannedRecord> scannedRecords;
+            scannedRecords.reserve(recordCount);
 
-            std::vector<std::uint8_t> valueBytes(valueLength);
-            if (valueLength > 0 && !ReadExact(valueBytes.data(), valueLength)) break;
+            bool batchReadOk = true;
+            std::uint64_t currentRecordOffset = batchStartOffset + sizeof(headerMagic) + sizeof(batchId) + sizeof(recordCount);
 
+            for (std::uint32_t r = 0; r < recordCount; ++r) {
+                std::uint64_t version = 0;
+                std::uint8_t tombstone = 0;
+                std::uint32_t keyLength = 0;
+
+                if (!ReadExact(&version, sizeof(version)) ||
+                    !ReadExact(&tombstone, sizeof(tombstone)) ||
+                    !ReadExact(&keyLength, sizeof(keyLength))) {
+                    batchReadOk = false;
+                    break;
+                }
+
+                if (keyLength > kMaxReasonableLength) {
+                    batchReadOk = false;
+                    break;
+                }
+
+                std::vector<std::uint8_t> keyBytes(keyLength);
+                if (keyLength > 0 && !ReadExact(keyBytes.data(), keyLength)) {
+                    batchReadOk = false;
+                    break;
+                }
+
+                std::uint32_t valueLength = 0;
+                if (!ReadExact(&valueLength, sizeof(valueLength))) {
+                    batchReadOk = false;
+                    break;
+                }
+                if (valueLength > kMaxReasonableLength) {
+                    batchReadOk = false;
+                    break;
+                }
+
+                std::vector<std::uint8_t> valueBytes(valueLength);
+                if (valueLength > 0 && !ReadExact(valueBytes.data(), valueLength)) {
+                    batchReadOk = false;
+                    break;
+                }
+
+                AppendRaw(batchDataForCrc, version);
+                AppendRaw(batchDataForCrc, tombstone);
+                AppendRaw(batchDataForCrc, keyLength);
+                batchDataForCrc.insert(batchDataForCrc.end(), keyBytes.begin(), keyBytes.end());
+                AppendRaw(batchDataForCrc, valueLength);
+                batchDataForCrc.insert(batchDataForCrc.end(), valueBytes.begin(), valueBytes.end());
+
+                std::string key(keyBytes.begin(), keyBytes.end());
+                scannedRecords.push_back(ScannedRecord{key, currentRecordOffset, tombstone != 0, version});
+
+                currentRecordOffset += sizeof(version) + sizeof(tombstone) + sizeof(keyLength) +
+                                       keyLength + sizeof(valueLength) + valueLength;
+            }
+
+            if (!batchReadOk) break;
+
+            std::uint32_t commitMagic = 0;
+            std::uint64_t commitBatchId = 0;
             std::uint32_t storedCrc = 0;
+
+            if (!ReadExact(&commitMagic, sizeof(commitMagic)) ||
+                !ReadExact(&commitBatchId, sizeof(commitBatchId)) ||
+                commitMagic != kBatchCommitMagic ||
+                commitBatchId != batchId) {
+                break;
+            }
+
+            AppendRaw(batchDataForCrc, commitMagic);
+            AppendRaw(batchDataForCrc, commitBatchId);
+
             if (!ReadExact(&storedCrc, sizeof(storedCrc))) break;
 
-            std::vector<std::uint8_t> forCrc;
-            AppendRaw(forCrc, magic);
-            AppendRaw(forCrc, sequence);
-            AppendRaw(forCrc, tombstone);
-            AppendRaw(forCrc, keyLength);
-            forCrc.insert(forCrc.end(), keyBytes.begin(), keyBytes.end());
-            AppendRaw(forCrc, valueLength);
-            forCrc.insert(forCrc.end(), valueBytes.begin(), valueBytes.end());
-            std::uint32_t computedCrc = Crc32::Compute(forCrc.data(), forCrc.size());
+            std::uint32_t computedCrc = Crc32::Compute(batchDataForCrc.data(), batchDataForCrc.size());
+            if (computedCrc != storedCrc) break; // Torn batch or corruption; stop here.
 
-            if (computedCrc != storedCrc) break; // torn tail; stop here.
+            // Batch is completely committed! Update in-memory index with version ordering.
+            for (const auto& rec : scannedRecords) {
+                auto it = index_.find(rec.key);
+                if (it == index_.end() || rec.version >= it->second.version) {
+                    index_[rec.key] = IndexEntry{rec.recordOffset, rec.tombstone, rec.version};
+                }
+                maxVersion = std::max(maxVersion, rec.version);
+            }
 
-            std::string key(keyBytes.begin(), keyBytes.end());
-            index_[key] = IndexEntry{offset, tombstone != 0};
-            maxSequence = std::max(maxSequence, sequence);
+            maxBatchId = std::max(maxBatchId, batchId);
 
-            // Recompute offset as "end of this record" for the next
-            // iteration and as the running valid-data watermark.
-            offset = offset
-                     + sizeof(magic) + sizeof(sequence) + sizeof(tombstone) + sizeof(keyLength)
-                     + keyLength + sizeof(valueLength) + valueLength + sizeof(storedCrc);
+            offset = currentRecordOffset + sizeof(commitMagic) + sizeof(commitBatchId) + sizeof(storedCrc);
             validEnd = offset;
         }
 
-        nextSequence_ = maxSequence + 1;
+        nextBatchId_ = maxBatchId + 1;
+        nextVersion_ = maxVersion + 1;
         endOffset_ = validEnd;
 
-        // Drop any torn/garbage tail bytes beyond the last valid record so
-        // future appends start from a clean, known-good point and nothing
-        // could ever later misinterpret the discarded bytes.
+        // Truncate any incomplete batch at EOF.
         auto sizeResult = file_->Size();
         if (sizeResult && sizeResult.Value() != validEnd) {
             auto setLenResult = file_->SetLength(validEnd);
@@ -159,11 +218,10 @@ public:
         auto seekResult = file_->Seek(static_cast<std::int64_t>(it->second.recordOffset), false);
         if (!seekResult) return Result<std::vector<std::uint8_t>>::Failure(seekResult.Err());
 
-        std::uint32_t magic = 0, keyLength = 0, valueLength = 0;
-        std::uint64_t sequence = 0;
+        std::uint64_t version = 0;
         std::uint8_t tombstone = 0;
-        if (!ReadExact(&magic, sizeof(magic)) || magic != kMagic ||
-            !ReadExact(&sequence, sizeof(sequence)) ||
+        std::uint32_t keyLength = 0;
+        if (!ReadExact(&version, sizeof(version)) ||
             !ReadExact(&tombstone, sizeof(tombstone)) ||
             !ReadExact(&keyLength, sizeof(keyLength))) {
             return Result<std::vector<std::uint8_t>>::Failure(
@@ -174,6 +232,7 @@ public:
             return Result<std::vector<std::uint8_t>>::Failure(
                 Error{ErrorCode::CorruptData, "backing store record key unreadable at indexed offset", 0});
         }
+        std::uint32_t valueLength = 0;
         if (!ReadExact(&valueLength, sizeof(valueLength))) {
             return Result<std::vector<std::uint8_t>>::Failure(
                 Error{ErrorCode::CorruptData, "backing store record value length unreadable", 0});
@@ -189,16 +248,28 @@ public:
 
     Result<void> Put(const std::string& key, const std::vector<std::uint8_t>& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return AppendRecord(key, value, /*tombstone=*/false);
+        std::uint64_t version = nextVersion_++;
+        BackingStoreRecord record{key, value, version, /*tombstone=*/false};
+        return AppendBatchLocked({record});
+    }
+
+    Result<void> PutBatch(const std::vector<BackingStoreRecord>& records) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (records.empty()) {
+            return Result<void>::Success();
+        }
+        return AppendBatchLocked(records);
     }
 
     Result<void> Remove(const std::string& key) override {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = index_.find(key);
         if (it == index_.end() || it->second.tombstone) {
-            return Result<void>::Success(); // idempotent: nothing to remove.
+            return Result<void>::Success(); // idempotent
         }
-        return AppendRecord(key, {}, /*tombstone=*/true);
+        std::uint64_t version = nextVersion_++;
+        BackingStoreRecord record{key, {}, version, /*tombstone=*/true};
+        return AppendBatchLocked({record});
     }
 
     bool Contains(const std::string& key) override {
@@ -216,22 +287,53 @@ public:
         return count;
     }
 
+    std::uint64_t GetVersion(const std::string& key) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = index_.find(key);
+        if (it == index_.end()) return 0;
+        return it->second.version;
+    }
+
 private:
-    Result<void> AppendRecord(const std::string& key, const std::vector<std::uint8_t>& value,
-                               bool tombstone) {
-        std::uint64_t sequence = nextSequence_;
-        std::uint8_t tombstoneByte = tombstone ? 1 : 0;
+    Result<void> AppendBatchLocked(const std::vector<BackingStoreRecord>& records) {
+        std::uint64_t batchId = nextBatchId_++;
 
         std::vector<std::uint8_t> frame;
-        AppendRaw(frame, kMagic);
-        AppendRaw(frame, sequence);
-        AppendRaw(frame, tombstoneByte);
-        AppendRaw(frame, static_cast<std::uint32_t>(key.size()));
-        frame.insert(frame.end(), key.begin(), key.end());
-        AppendRaw(frame, static_cast<std::uint32_t>(tombstone ? 0 : value.size()));
-        if (!tombstone) {
-            frame.insert(frame.end(), value.begin(), value.end());
+        AppendRaw(frame, kBatchHeaderMagic);
+        AppendRaw(frame, batchId);
+        AppendRaw(frame, static_cast<std::uint32_t>(records.size()));
+
+        struct PendingIndex {
+            std::string key;
+            std::uint64_t recordOffset;
+            bool tombstone;
+            std::uint64_t version;
+        };
+        std::vector<PendingIndex> pendingIndex;
+        pendingIndex.reserve(records.size());
+
+        for (const auto& rec : records) {
+            std::uint64_t recordOffset = endOffset_ + frame.size();
+            std::uint8_t tombstoneByte = rec.tombstone ? 1 : 0;
+            std::uint32_t keyLen = static_cast<std::uint32_t>(rec.key.size());
+            std::uint32_t valLen = static_cast<std::uint32_t>(rec.tombstone ? 0 : rec.value.size());
+
+            AppendRaw(frame, rec.version);
+            AppendRaw(frame, tombstoneByte);
+            AppendRaw(frame, keyLen);
+            frame.insert(frame.end(), rec.key.begin(), rec.key.end());
+            AppendRaw(frame, valLen);
+            if (!rec.tombstone && valLen > 0) {
+                frame.insert(frame.end(), rec.value.begin(), rec.value.end());
+            }
+
+            pendingIndex.push_back(PendingIndex{rec.key, recordOffset, rec.tombstone, rec.version});
+            nextVersion_ = std::max(nextVersion_, rec.version + 1);
         }
+
+        AppendRaw(frame, kBatchCommitMagic);
+        AppendRaw(frame, batchId);
+
         std::uint32_t crc = Crc32::Compute(frame.data(), frame.size());
         AppendRaw(frame, crc);
 
@@ -241,19 +343,22 @@ private:
         auto writeResult = file_->Write(frame.data(), frame.size());
         if (!writeResult || writeResult.Value() != frame.size()) {
             return Result<void>::Failure(
-                Error{ErrorCode::IoError, "backing store append: short write", 0});
+                Error{ErrorCode::IoError, "backing store batch append: short write", 0});
         }
 
-        // Never acknowledge this Put/Remove as durable before the actual
-        // flush-to-stable-media boundary is reached (same rule the
-        // write-ahead journal follows).
+        // Single durable flush for the entire batch.
         auto flushResult = file_->FlushDurable();
         if (!flushResult) return flushResult;
 
-        index_[key] = IndexEntry{endOffset_, tombstone};
-        endOffset_ += frame.size();
-        ++nextSequence_;
+        // Apply to in-memory index only after durability is confirmed!
+        for (const auto& p : pendingIndex) {
+            auto it = index_.find(p.key);
+            if (it == index_.end() || p.version >= it->second.version) {
+                index_[p.key] = IndexEntry{p.recordOffset, p.tombstone, p.version};
+            }
+        }
 
+        endOffset_ += frame.size();
         return Result<void>::Success();
     }
 
@@ -266,7 +371,8 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<std::string, IndexEntry> index_;
     std::uint64_t endOffset_{0};
-    std::uint64_t nextSequence_{0};
+    std::uint64_t nextBatchId_{1};
+    std::uint64_t nextVersion_{1};
 };
 
 } // namespace
