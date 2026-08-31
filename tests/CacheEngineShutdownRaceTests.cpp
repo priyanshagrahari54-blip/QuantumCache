@@ -91,6 +91,14 @@ public:
         return result;
     }
 
+    Common::Result<std::uint64_t> AppendNoFlush(const std::vector<std::uint8_t>& payload) override {
+        return inner_->AppendNoFlush(payload);
+    }
+
+    Common::Result<void> FlushDurable() override {
+        return inner_->FlushDurable();
+    }
+
     Common::Result<void> Replay(const PowerResilience::ReplayCallback& callback) override {
         return inner_->Replay(callback);
     }

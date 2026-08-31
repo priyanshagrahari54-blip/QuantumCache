@@ -45,6 +45,11 @@ public:
     [[nodiscard]] virtual Common::Result<void> Put(
         const std::string& key, const std::vector<std::uint8_t>& value) = 0;
 
+    [[nodiscard]] virtual Common::Result<void> PutBatch(
+        const std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& entries) = 0;
+
+    [[nodiscard]] virtual Common::Result<void> FlushDurable() = 0;
+
     [[nodiscard]] virtual Common::Result<void> Remove(const std::string& key) = 0;
 
     [[nodiscard]] virtual bool Contains(const std::string& key) = 0;

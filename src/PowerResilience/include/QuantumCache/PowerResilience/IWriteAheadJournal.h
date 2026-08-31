@@ -40,6 +40,14 @@ public:
     [[nodiscard]] virtual Common::Result<std::uint64_t> Append(
         const std::vector<std::uint8_t>& payload) = 0;
 
+    // Appends one record without calling FlushDurable(), allowing caller to
+    // batch multiple appends before issuing a single FlushDurable().
+    [[nodiscard]] virtual Common::Result<std::uint64_t> AppendNoFlush(
+        const std::vector<std::uint8_t>& payload) = 0;
+
+    // Durably flushes any pending journal records to stable media.
+    [[nodiscard]] virtual Common::Result<void> FlushDurable() = 0;
+
     // Replays every valid, fully-committed record in sequence order,
     // invoking `callback` for each. Stops (without error) at the first
     // record that fails its integrity check (CRC mismatch / truncated

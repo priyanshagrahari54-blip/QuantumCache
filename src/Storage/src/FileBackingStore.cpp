@@ -189,7 +189,22 @@ public:
 
     Result<void> Put(const std::string& key, const std::vector<std::uint8_t>& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return AppendRecord(key, value, /*tombstone=*/false);
+        return AppendRecord(key, value, /*tombstone=*/false, /*flushDurable=*/true);
+    }
+
+    Result<void> PutBatch(
+        const std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& entries) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [key, value] : entries) {
+            auto result = AppendRecord(key, value, /*tombstone=*/false, /*flushDurable=*/false);
+            if (!result) return result;
+        }
+        return file_->FlushDurable();
+    }
+
+    Result<void> FlushDurable() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return file_->FlushDurable();
     }
 
     Result<void> Remove(const std::string& key) override {
@@ -218,7 +233,7 @@ public:
 
 private:
     Result<void> AppendRecord(const std::string& key, const std::vector<std::uint8_t>& value,
-                               bool tombstone) {
+                               bool tombstone, bool flushDurable = true) {
         std::uint64_t sequence = nextSequence_;
         std::uint8_t tombstoneByte = tombstone ? 1 : 0;
 
@@ -244,11 +259,10 @@ private:
                 Error{ErrorCode::IoError, "backing store append: short write", 0});
         }
 
-        // Never acknowledge this Put/Remove as durable before the actual
-        // flush-to-stable-media boundary is reached (same rule the
-        // write-ahead journal follows).
-        auto flushResult = file_->FlushDurable();
-        if (!flushResult) return flushResult;
+        if (flushDurable) {
+            auto flushResult = file_->FlushDurable();
+            if (!flushResult) return flushResult;
+        }
 
         index_[key] = IndexEntry{endOffset_, tombstone};
         endOffset_ += frame.size();

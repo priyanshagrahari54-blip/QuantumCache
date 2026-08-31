@@ -119,6 +119,15 @@ public:
         return inner_->Put(key, value);
     }
 
+    Common::Result<void> PutBatch(
+        const std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& entries) override {
+        return inner_->PutBatch(entries);
+    }
+
+    Common::Result<void> FlushDurable() override {
+        return inner_->FlushDurable();
+    }
+
     Common::Result<void> Remove(const std::string& key) override { return inner_->Remove(key); }
 
     bool Contains(const std::string& key) override { return inner_->Contains(key); }

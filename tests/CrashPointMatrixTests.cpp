@@ -176,6 +176,14 @@ public:
         return result;
     }
 
+    Common::Result<std::uint64_t> AppendNoFlush(const std::vector<std::uint8_t>& payload) override {
+        return inner_->AppendNoFlush(payload);
+    }
+
+    Common::Result<void> FlushDurable() override {
+        return inner_->FlushDurable();
+    }
+
     Common::Result<void> Replay(const PowerResilience::ReplayCallback& callback) override {
         return inner_->Replay(callback);
     }
@@ -216,6 +224,24 @@ public:
                               "SIMULATED_CRASH: after backing-store write/durability", 0});
         }
         return result;
+    }
+    Common::Result<void> PutBatch(
+        const std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& entries) override {
+        if (crashPoint_ == CrashPoint::DuringBackingStoreWrite) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError, "SIMULATED_CRASH: during backing-store write", 0});
+        }
+        auto result = inner_->PutBatch(entries);
+        if (result.IsOk() && (crashPoint_ == CrashPoint::AfterBackingStoreWrite ||
+                               crashPoint_ == CrashPoint::AfterBackingStoreDurability)) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError,
+                              "SIMULATED_CRASH: after backing-store write/durability", 0});
+        }
+        return result;
+    }
+    Common::Result<void> FlushDurable() override {
+        return inner_->FlushDurable();
     }
     Common::Result<void> Remove(const std::string& key) override {
         if (crashPoint_ == CrashPoint::DuringBackingStoreWrite) {

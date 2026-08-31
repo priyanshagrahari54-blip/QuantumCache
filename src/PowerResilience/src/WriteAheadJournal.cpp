@@ -51,7 +51,7 @@ class WriteAheadJournal final : public IWriteAheadJournal {
 public:
     explicit WriteAheadJournal(std::unique_ptr<Storage::IFile> file) : file_(std::move(file)) {}
 
-    Result<std::uint64_t> Append(const std::vector<std::uint8_t>& payload) override {
+    Result<std::uint64_t> AppendNoFlush(const std::vector<std::uint8_t>& payload) override {
         std::uint64_t seq = nextSequenceNumber_;
 
         std::vector<std::uint8_t> frame;
@@ -74,12 +74,23 @@ public:
                 Error{ErrorCode::IoError, "journal append: short write", 0});
         }
 
-        auto flushResult = file_->FlushDurable();
-        if (!flushResult) return Result<std::uint64_t>::Failure(flushResult.Err());
-
         ++nextSequenceNumber_;
         ++recordCount_;
         return Result<std::uint64_t>::Success(seq);
+    }
+
+    Result<std::uint64_t> Append(const std::vector<std::uint8_t>& payload) override {
+        auto seqResult = AppendNoFlush(payload);
+        if (!seqResult) return seqResult;
+
+        auto flushResult = file_->FlushDurable();
+        if (!flushResult) return Result<std::uint64_t>::Failure(flushResult.Err());
+
+        return seqResult;
+    }
+
+    Result<void> FlushDurable() override {
+        return file_->FlushDurable();
     }
 
     Result<void> Replay(const ReplayCallback& callback) override {

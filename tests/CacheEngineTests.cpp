@@ -361,6 +361,248 @@ TEST_F(CacheEngineTest, FlushAll_FlushesEveryDirtyEntry) {
     }
 }
 
+namespace {
+class JournalFlushFailingDecorator final : public PowerResilience::IWriteAheadJournal {
+public:
+    explicit JournalFlushFailingDecorator(std::shared_ptr<PowerResilience::IWriteAheadJournal> inner)
+        : inner_(std::move(inner)) {}
+
+    Common::Result<std::uint64_t> Append(const std::vector<std::uint8_t>& payload) override {
+        auto result = AppendNoFlush(payload);
+        if (!result) return result;
+        auto flushRes = FlushDurable();
+        if (!flushRes) return Common::Result<std::uint64_t>::Failure(flushRes.Err());
+        return result;
+    }
+    Common::Result<std::uint64_t> AppendNoFlush(const std::vector<std::uint8_t>& payload) override {
+        ++appendNoFlushCallCount;
+        if (failOnAppendNoFlushCallNumber > 0 && appendNoFlushCallCount == failOnAppendNoFlushCallNumber) {
+            return Common::Result<std::uint64_t>::Failure(
+                Common::Error{Common::ErrorCode::IoError, "simulated journal AppendNoFlush failure", 0});
+        }
+        return inner_->AppendNoFlush(payload);
+    }
+    Common::Result<void> FlushDurable() override {
+        ++flushCallCount;
+        if (failOnFlushCallNumber > 0 && flushCallCount == failOnFlushCallNumber) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError, "simulated journal FlushDurable failure", 0});
+        }
+        return inner_->FlushDurable();
+    }
+    Common::Result<void> Replay(const PowerResilience::ReplayCallback& callback) override {
+        return inner_->Replay(callback);
+    }
+    Common::Result<void> Truncate() override { return inner_->Truncate(); }
+    std::size_t RecordCount() const noexcept override { return inner_->RecordCount(); }
+
+    int failOnFlushCallNumber{0};
+    int flushCallCount{0};
+    int failOnAppendNoFlushCallNumber{0};
+    int appendNoFlushCallCount{0};
+
+private:
+    std::shared_ptr<PowerResilience::IWriteAheadJournal> inner_;
+};
+
+class BatchFailingBackingStoreDecorator final : public Storage::IBackingStore {
+public:
+    explicit BatchFailingBackingStoreDecorator(std::shared_ptr<Storage::IBackingStore> inner)
+        : inner_(std::move(inner)) {}
+
+    Common::Result<std::vector<std::uint8_t>> Get(const std::string& key) override {
+        return inner_->Get(key);
+    }
+    Common::Result<void> Put(const std::string& key, const std::vector<std::uint8_t>& value) override {
+        return inner_->Put(key, value);
+    }
+    Common::Result<void> PutBatch(
+        const std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& entries) override {
+        if (failPutBatch) {
+            failPutBatch = false;
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError, "simulated PutBatch failure", 0});
+        }
+        return inner_->PutBatch(entries);
+    }
+    Common::Result<void> FlushDurable() override { return inner_->FlushDurable(); }
+    Common::Result<void> Remove(const std::string& key) override { return inner_->Remove(key); }
+    bool Contains(const std::string& key) override { return inner_->Contains(key); }
+    std::size_t EntryCount() const noexcept override { return inner_->EntryCount(); }
+
+    bool failPutBatch{false};
+
+private:
+    std::shared_ptr<Storage::IBackingStore> inner_;
+};
+} // namespace
+
+TEST_F(CacheEngineTest, FlushAll_BatchBoundaryPhase1Failure_FlushIntentJournalFlushFails_RecoversDirty) {
+    auto journalFile = Storage::OpenFile(PathFor("batchp1.journal"), Storage::OpenMode::OpenOrCreate);
+    ASSERT_TRUE(journalFile.IsOk());
+    auto realJournalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
+    auto journalDecorator = std::make_shared<JournalFlushFailingDecorator>(std::move(realJournalResult.Value()));
+
+    auto backingResult = Storage::OpenFileBackingStore(PathFor("batchp1.store"));
+    ASSERT_TRUE(backingResult.IsOk());
+    std::shared_ptr<Storage::IBackingStore> backingStore = std::move(backingResult.Value());
+
+    {
+        auto engineResult = CoreEngine::CreateCacheEngine(
+            CoreEngine::CacheEngineOptions{}, backingStore, journalDecorator);
+        ASSERT_TRUE(engineResult.IsOk());
+        auto engine = std::move(engineResult.Value());
+        ASSERT_TRUE(engine->MarkRecoveryComplete().IsOk());
+
+        ASSERT_TRUE(engine->Put("k1", Bytes("v1")).IsOk()); // flush call 1
+        ASSERT_TRUE(engine->Put("k2", Bytes("v2")).IsOk()); // flush call 2
+
+        // Fail phase 1 (3rd flush call overall).
+        journalDecorator->failOnFlushCallNumber = 3;
+        auto flushResult = engine->FlushAll();
+        EXPECT_FALSE(flushResult.IsOk());
+
+        // Entries remain dirty in memory.
+        auto info1 = engine->GetEntryInfo("k1");
+        ASSERT_TRUE(info1.IsOk());
+        EXPECT_EQ(info1.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+    }
+
+    // Reconstruct fresh & replay.
+    auto jFile2 = Storage::OpenFile(PathFor("batchp1.journal"), Storage::OpenMode::OpenExisting);
+    auto jRes2 = PowerResilience::CreateWriteAheadJournal(std::move(jFile2.Value()));
+    auto store2 = Storage::OpenFileBackingStore(PathFor("batchp1.store"));
+    std::shared_ptr<Storage::IBackingStore> storePtr2 = std::move(store2.Value());
+    std::shared_ptr<PowerResilience::IWriteAheadJournal> jPtr2 = std::move(jRes2.Value());
+    auto engineResult2 = CoreEngine::CreateCacheEngine(
+        CoreEngine::CacheEngineOptions{}, storePtr2, jPtr2);
+    auto engine2 = std::move(engineResult2.Value());
+
+    ASSERT_TRUE(engine2->ReplayFromJournal().IsOk());
+    ASSERT_TRUE(engine2->MarkRecoveryComplete().IsOk());
+
+    auto get1 = engine2->Get("k1");
+    ASSERT_TRUE(get1.IsOk());
+    EXPECT_EQ(ToStr(get1.Value()), "v1");
+    auto info = engine2->GetEntryInfo("k1");
+    ASSERT_TRUE(info.IsOk());
+    EXPECT_EQ(info.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+}
+
+TEST_F(CacheEngineTest, FlushAll_BatchBoundaryPhase2Failure_BackingStorePutBatchFails_RecoversDirty) {
+    auto journalFile = Storage::OpenFile(PathFor("batchp2.journal"), Storage::OpenMode::OpenOrCreate);
+    ASSERT_TRUE(journalFile.IsOk());
+    auto journalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
+    std::shared_ptr<PowerResilience::IWriteAheadJournal> journal = std::move(journalResult.Value());
+
+    auto backingResult = Storage::OpenFileBackingStore(PathFor("batchp2.store"));
+    ASSERT_TRUE(backingResult.IsOk());
+    auto storeDecorator = std::make_shared<BatchFailingBackingStoreDecorator>(std::move(backingResult.Value()));
+
+    {
+        auto engineResult = CoreEngine::CreateCacheEngine(
+            CoreEngine::CacheEngineOptions{}, storeDecorator, journal);
+        ASSERT_TRUE(engineResult.IsOk());
+        auto engine = std::move(engineResult.Value());
+        ASSERT_TRUE(engine->MarkRecoveryComplete().IsOk());
+
+        ASSERT_TRUE(engine->Put("k1", Bytes("v1")).IsOk());
+        ASSERT_TRUE(engine->Put("k2", Bytes("v2")).IsOk());
+
+        // Fail phase 2 (PutBatch on backing store).
+        storeDecorator->failPutBatch = true;
+        auto flushResult = engine->FlushAll();
+        EXPECT_FALSE(flushResult.IsOk());
+
+        // Entries revert to Dirty in memory.
+        auto info1 = engine->GetEntryInfo("k1");
+        ASSERT_TRUE(info1.IsOk());
+        EXPECT_EQ(info1.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+    }
+
+    // Reconstruct fresh & replay.
+    auto jFile2 = Storage::OpenFile(PathFor("batchp2.journal"), Storage::OpenMode::OpenExisting);
+    auto jRes2 = PowerResilience::CreateWriteAheadJournal(std::move(jFile2.Value()));
+    auto store2 = Storage::OpenFileBackingStore(PathFor("batchp2.store"));
+    std::shared_ptr<Storage::IBackingStore> storePtr2 = std::move(store2.Value());
+    std::shared_ptr<PowerResilience::IWriteAheadJournal> jPtr2 = std::move(jRes2.Value());
+    auto engineResult2 = CoreEngine::CreateCacheEngine(
+        CoreEngine::CacheEngineOptions{}, storePtr2, jPtr2);
+    auto engine2 = std::move(engineResult2.Value());
+
+    ASSERT_TRUE(engine2->ReplayFromJournal().IsOk());
+    ASSERT_TRUE(engine2->MarkRecoveryComplete().IsOk());
+
+    auto get1 = engine2->Get("k1");
+    ASSERT_TRUE(get1.IsOk());
+    EXPECT_EQ(ToStr(get1.Value()), "v1");
+    auto info = engine2->GetEntryInfo("k1");
+    ASSERT_TRUE(info.IsOk());
+    EXPECT_EQ(info.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+}
+
+TEST_F(CacheEngineTest, FlushAll_BatchBoundaryPhase3Failure_FlushCompleteFails_RecoversDirty) {
+    auto journalFile = Storage::OpenFile(PathFor("batchp3.journal"), Storage::OpenMode::OpenOrCreate);
+    ASSERT_TRUE(journalFile.IsOk());
+    auto realJournalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
+    auto journalDecorator = std::make_shared<JournalFlushFailingDecorator>(std::move(realJournalResult.Value()));
+
+    auto backingResult = Storage::OpenFileBackingStore(PathFor("batchp3.store"));
+    ASSERT_TRUE(backingResult.IsOk());
+    std::shared_ptr<Storage::IBackingStore> backingStore = std::move(backingResult.Value());
+
+    {
+        auto engineResult = CoreEngine::CreateCacheEngine(
+            CoreEngine::CacheEngineOptions{}, backingStore, journalDecorator);
+        ASSERT_TRUE(engineResult.IsOk());
+        auto engine = std::move(engineResult.Value());
+        ASSERT_TRUE(engine->MarkRecoveryComplete().IsOk());
+
+        ASSERT_TRUE(engine->Put("k1", Bytes("v1")).IsOk()); // append call 1
+        ASSERT_TRUE(engine->Put("k2", Bytes("v2")).IsOk()); // append call 2
+
+        // Phase 1 appends FlushIntents (append calls 3 & 4).
+        // Phase 3 appends FlushCompletes (append call 5). Fail call 5!
+        journalDecorator->failOnAppendNoFlushCallNumber = 5;
+        auto flushResult = engine->FlushAll();
+        EXPECT_FALSE(flushResult.IsOk());
+
+        // Backing store DID receive the batch write in Phase 2, but FlushComplete failed in Phase 3.
+        EXPECT_TRUE(backingStore->Contains("k1"));
+        EXPECT_TRUE(backingStore->Contains("k2"));
+
+        // Entries in memory revert to Dirty.
+        auto info1 = engine->GetEntryInfo("k1");
+        ASSERT_TRUE(info1.IsOk());
+        EXPECT_EQ(info1.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+    }
+
+    // Reconstruct fresh & replay.
+    auto jFile2 = Storage::OpenFile(PathFor("batchp3.journal"), Storage::OpenMode::OpenExisting);
+    auto jRes2 = PowerResilience::CreateWriteAheadJournal(std::move(jFile2.Value()));
+    auto store2 = Storage::OpenFileBackingStore(PathFor("batchp3.store"));
+    std::shared_ptr<Storage::IBackingStore> storePtr3 = std::move(store2.Value());
+    std::shared_ptr<PowerResilience::IWriteAheadJournal> jPtr3 = std::move(jRes2.Value());
+    auto engineResult2 = CoreEngine::CreateCacheEngine(
+        CoreEngine::CacheEngineOptions{}, storePtr3, jPtr3);
+    auto engine2 = std::move(engineResult2.Value());
+
+    ASSERT_TRUE(engine2->ReplayFromJournal().IsOk());
+    ASSERT_TRUE(engine2->MarkRecoveryComplete().IsOk());
+
+    // Because FlushComplete was never written to journal, replay recovers keys as Dirty.
+    auto info1 = engine2->GetEntryInfo("k1");
+    ASSERT_TRUE(info1.IsOk());
+    EXPECT_EQ(info1.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+
+    // Now a subsequent FlushAll succeeds and updates state to Clean.
+    ASSERT_TRUE(engine2->FlushAll().IsOk());
+    auto infoClean = engine2->GetEntryInfo("k1");
+    if (infoClean.IsOk()) {
+        EXPECT_EQ(infoClean.Value().dirtyState, CoreEngine::EntryDirtyState::Clean);
+    }
+}
+
 // ---------------------------------------------------------------------
 // Stage 2B: periodic background flush (FlushPolicyKind::PeriodicBackground).
 //
@@ -724,6 +966,13 @@ public:
     Common::Result<void> Put(const std::string& key, const std::vector<std::uint8_t>& value) override {
         return inner_->Put(key, value);
     }
+    Common::Result<void> PutBatch(
+        const std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& entries) override {
+        return inner_->PutBatch(entries);
+    }
+    Common::Result<void> FlushDurable() override {
+        return inner_->FlushDurable();
+    }
     Common::Result<void> Remove(const std::string& key) override {
         removeCallCount++;
         if (key == failKey) {
@@ -959,6 +1208,19 @@ TEST_F(CacheEngineTest, FlushAll_DoesNotCompactJournal_WhenAFlushFails_DirtyData
                     Common::Error{Common::ErrorCode::IoError, "simulated backing-store Put() failure", 0});
             }
             return inner_->Put(key, value);
+        }
+        Common::Result<void> PutBatch(
+            const std::vector<std::pair<std::string, std::vector<std::uint8_t>>>& entries) override {
+            for (const auto& [key, value] : entries) {
+                if (key == failKey) {
+                    return Common::Result<void>::Failure(
+                        Common::Error{Common::ErrorCode::IoError, "simulated backing-store PutBatch() failure", 0});
+                }
+            }
+            return inner_->PutBatch(entries);
+        }
+        Common::Result<void> FlushDurable() override {
+            return inner_->FlushDurable();
         }
         Common::Result<void> Remove(const std::string& key) override { return inner_->Remove(key); }
         bool Contains(const std::string& key) override { return inner_->Contains(key); }

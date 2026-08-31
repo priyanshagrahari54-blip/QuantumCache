@@ -156,6 +156,7 @@ TEST_F(PerformanceResourceTest, PutLatency_DoesNotDegradeSuperlinearly_1Kto100K)
 
     CoreEngine::CacheEngineOptions options;
     options.capacityBytes = 256ull * 1024 * 1024; // generous: not the bottleneck here
+    options.maxEntryCount = 200000;
     auto engineResult = CoreEngine::CreateCacheEngine(options, backingStore, journal);
     ASSERT_TRUE(engineResult.IsOk());
     auto engine = std::move(engineResult.Value());
@@ -207,6 +208,7 @@ TEST_F(PerformanceResourceTest, FlushAllLatency_100KEntries_CompletesWithinSaneB
 
     CoreEngine::CacheEngineOptions options;
     options.capacityBytes = 256ull * 1024 * 1024;
+    options.maxEntryCount = 200000;
     auto engineResult = CoreEngine::CreateCacheEngine(options, backingStore, journal);
     ASSERT_TRUE(engineResult.IsOk());
     auto engine = std::move(engineResult.Value());
