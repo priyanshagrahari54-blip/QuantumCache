@@ -37,6 +37,11 @@ public:
     [[nodiscard]] virtual Common::Result<std::vector<std::uint8_t>> Get(
         const std::string& key) = 0;
 
+    struct BatchItem {
+        std::string key;
+        std::vector<std::uint8_t> value;
+    };
+
     // Durably persists `value` under `key`, appending to the underlying
     // log and requiring a caller-visible success only once the write is
     // confirmed on stable storage (FlushDurable is called internally
@@ -44,6 +49,18 @@ public:
     // project's "never fake durability" rule.
     [[nodiscard]] virtual Common::Result<void> Put(
         const std::string& key, const std::vector<std::uint8_t>& value) = 0;
+
+    // Durably persists a batch of key/value pairs in one batch append
+    // and performs a single FlushDurable call. Default implementation
+    // loops over Put for backward compatibility with decorators.
+    [[nodiscard]] virtual Common::Result<void> PutBatch(
+        const std::vector<BatchItem>& items) {
+        for (const auto& item : items) {
+            auto res = Put(item.key, item.value);
+            if (!res) return res;
+        }
+        return Common::Result<void>::Success();
+    }
 
     [[nodiscard]] virtual Common::Result<void> Remove(const std::string& key) = 0;
 

@@ -176,6 +176,31 @@ public:
         return result;
     }
 
+    Common::Result<void> AppendBatch(const std::vector<std::vector<std::uint8_t>>& payloads) override {
+        ++callCount_;
+        bool isTarget = (callCount_ == targetCallNumber_);
+
+        if (isTarget && (crashPoint_ == CrashPoint::BeforeJournalAppend ||
+                          crashPoint_ == CrashPoint::DuringJournalAppend)) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError, "SIMULATED_CRASH: before/during journal batch append", 0});
+        }
+
+        auto result = inner_->AppendBatch(payloads);
+
+        if (isTarget && crashPoint_ == CrashPoint::AfterJournalDurability && result.IsOk()) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError,
+                              "SIMULATED_CRASH: after journal batch durability, before caller could react", 0});
+        }
+        if (isTarget && crashPoint_ == CrashPoint::DuringMetadataUpdate && result.IsOk()) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError,
+                              "SIMULATED_CRASH: during multi-record metadata update sequence", 0});
+        }
+        return result;
+    }
+
     Common::Result<void> Replay(const PowerResilience::ReplayCallback& callback) override {
         return inner_->Replay(callback);
     }
@@ -214,6 +239,21 @@ public:
             return Common::Result<void>::Failure(
                 Common::Error{Common::ErrorCode::IoError,
                               "SIMULATED_CRASH: after backing-store write/durability", 0});
+        }
+        return result;
+    }
+
+    Common::Result<void> PutBatch(const std::vector<BatchItem>& items) override {
+        if (crashPoint_ == CrashPoint::DuringBackingStoreWrite) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError, "SIMULATED_CRASH: during backing-store batch write", 0});
+        }
+        auto result = inner_->PutBatch(items);
+        if (result.IsOk() && (crashPoint_ == CrashPoint::AfterBackingStoreWrite ||
+                               crashPoint_ == CrashPoint::AfterBackingStoreDurability)) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError,
+                              "SIMULATED_CRASH: after backing-store batch write/durability", 0});
         }
         return result;
     }
@@ -499,6 +539,125 @@ TEST_F(CrashPointMatrixTest, Flush_CrashDuringBackingStoreWrite_RecoversAsStillD
     EXPECT_EQ(info.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty)
         << "REJECTED IMPOSSIBLE STATE (metadata/data divergence): FlushIntent alone (without a "
            "matching FlushComplete) must never be interpreted as Clean";
+}
+
+TEST_F(CrashPointMatrixTest, FlushAllBatch_CrashBeforeFlushIntentBatch_RecoversAsDirty) {
+    auto journalFile = Storage::OpenFile(PathFor("j.dat"), Storage::OpenMode::OpenOrCreate);
+    ASSERT_TRUE(journalFile.IsOk());
+    auto realJournalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
+    auto crashJournal = std::make_shared<CrashInjectingJournal>(std::move(realJournalResult.Value()));
+
+    auto backingResult = Storage::OpenFileBackingStore(PathFor("s.dat"));
+    ASSERT_TRUE(backingResult.IsOk());
+    std::shared_ptr<Storage::IBackingStore> backingStore = std::move(backingResult.Value());
+
+    {
+        auto engineResult = CoreEngine::CreateCacheEngine(
+            CoreEngine::CacheEngineOptions{}, backingStore, crashJournal);
+        ASSERT_TRUE(engineResult.IsOk());
+        auto engine = std::move(engineResult.Value());
+        ASSERT_TRUE(engine->MarkRecoveryComplete().IsOk());
+
+        ASSERT_TRUE(engine->Put("bak1", Bytes("v1")).IsOk());
+        ASSERT_TRUE(engine->Put("bak2", Bytes("v2")).IsOk());
+
+        // Crash on 1st batch append (FlushIntent batch)
+        crashJournal->ArmCrash(CrashPoint::BeforeJournalAppend, /*atCallNumber=*/1);
+        auto flushResult = engine->FlushAll();
+        EXPECT_FALSE(flushResult.IsOk());
+    }
+
+    auto rig = RecoverFresh("j.dat", "s.dat");
+    ASSERT_TRUE(rig.recoverySucceeded);
+    auto get1 = rig.engine->Get("bak1");
+    ASSERT_TRUE(get1.IsOk());
+    EXPECT_EQ(ToStr(get1.Value()), "v1");
+    auto info1 = rig.engine->GetEntryInfo("bak1");
+    ASSERT_TRUE(info1.IsOk());
+    EXPECT_EQ(info1.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+
+    auto get2 = rig.engine->Get("bak2");
+    ASSERT_TRUE(get2.IsOk());
+    EXPECT_EQ(ToStr(get2.Value()), "v2");
+    auto info2 = rig.engine->GetEntryInfo("bak2");
+    ASSERT_TRUE(info2.IsOk());
+    EXPECT_EQ(info2.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+}
+
+TEST_F(CrashPointMatrixTest, FlushAllBatch_CrashDuringBackingStorePutBatch_RecoversAsDirty) {
+    auto journalFile = Storage::OpenFile(PathFor("j.dat"), Storage::OpenMode::OpenOrCreate);
+    ASSERT_TRUE(journalFile.IsOk());
+    auto journalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
+    std::shared_ptr<PowerResilience::IWriteAheadJournal> journal = std::move(journalResult.Value());
+
+    auto backingResult = Storage::OpenFileBackingStore(PathFor("s.dat"));
+    ASSERT_TRUE(backingResult.IsOk());
+    auto crashStore = std::make_shared<CrashInjectingBackingStore>(std::move(backingResult.Value()));
+
+    {
+        auto engineResult = CoreEngine::CreateCacheEngine(
+            CoreEngine::CacheEngineOptions{}, crashStore, journal);
+        ASSERT_TRUE(engineResult.IsOk());
+        auto engine = std::move(engineResult.Value());
+        ASSERT_TRUE(engine->MarkRecoveryComplete().IsOk());
+
+        ASSERT_TRUE(engine->Put("bak1", Bytes("v1")).IsOk());
+        ASSERT_TRUE(engine->Put("bak2", Bytes("v2")).IsOk());
+
+        crashStore->ArmCrash(CrashPoint::DuringBackingStoreWrite);
+        auto flushResult = engine->FlushAll();
+        EXPECT_FALSE(flushResult.IsOk());
+    }
+
+    auto rig = RecoverFresh("j.dat", "s.dat");
+    ASSERT_TRUE(rig.recoverySucceeded);
+    auto get1 = rig.engine->Get("bak1");
+    ASSERT_TRUE(get1.IsOk());
+    EXPECT_EQ(ToStr(get1.Value()), "v1");
+    auto info1 = rig.engine->GetEntryInfo("bak1");
+    ASSERT_TRUE(info1.IsOk());
+    EXPECT_EQ(info1.Value().dirtyState, CoreEngine::EntryDirtyState::Dirty);
+}
+
+TEST_F(CrashPointMatrixTest, FlushAllBatch_CrashAfterBackingStorePutBatch_BeforeFlushComplete_RecoversSafely) {
+    auto journalFile = Storage::OpenFile(PathFor("j.dat"), Storage::OpenMode::OpenOrCreate);
+    ASSERT_TRUE(journalFile.IsOk());
+    auto realJournalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
+    auto crashJournal = std::make_shared<CrashInjectingJournal>(std::move(realJournalResult.Value()));
+
+    auto backingResult = Storage::OpenFileBackingStore(PathFor("s.dat"));
+    ASSERT_TRUE(backingResult.IsOk());
+    std::shared_ptr<Storage::IBackingStore> backingStore = std::move(backingResult.Value());
+
+    {
+        auto engineResult = CoreEngine::CreateCacheEngine(
+            CoreEngine::CacheEngineOptions{}, backingStore, crashJournal);
+        ASSERT_TRUE(engineResult.IsOk());
+        auto engine = std::move(engineResult.Value());
+        ASSERT_TRUE(engine->MarkRecoveryComplete().IsOk());
+
+        ASSERT_TRUE(engine->Put("bak1", Bytes("v1")).IsOk());
+        ASSERT_TRUE(engine->Put("bak2", Bytes("v2")).IsOk());
+
+        // Call 1 = FlushIntent batch append succeeds
+        // BackingStore PutBatch succeeds
+        // Call 2 = FlushComplete batch append crashes
+        crashJournal->ArmCrash(CrashPoint::BeforeJournalAppend, /*atCallNumber=*/2);
+        auto flushResult = engine->FlushAll();
+        EXPECT_FALSE(flushResult.IsOk());
+    }
+
+    auto rig = RecoverFresh("j.dat", "s.dat");
+    ASSERT_TRUE(rig.recoverySucceeded);
+    auto get1 = rig.engine->Get("bak1");
+    ASSERT_TRUE(get1.IsOk());
+    EXPECT_EQ(ToStr(get1.Value()), "v1");
+    EXPECT_TRUE(rig.backingStore->Contains("bak1"));
+
+    auto get2 = rig.engine->Get("bak2");
+    ASSERT_TRUE(get2.IsOk());
+    EXPECT_EQ(ToStr(get2.Value()), "v2");
+    EXPECT_TRUE(rig.backingStore->Contains("bak2"));
 }
 
 TEST_F(CrashPointMatrixTest, Flush_CrashAfterBackingStoreWrite_BeforeFlushComplete_RecoversSafely_NoDataLoss) {

@@ -82,6 +82,45 @@ public:
         return Result<std::uint64_t>::Success(seq);
     }
 
+    Result<void> AppendBatch(const std::vector<std::vector<std::uint8_t>>& payloads) override {
+        if (payloads.empty()) return Result<void>::Success();
+
+        std::vector<std::uint8_t> batchBuffer;
+        std::uint64_t currentSeq = nextSequenceNumber_;
+
+        for (const auto& payload : payloads) {
+            std::vector<std::uint8_t> frame;
+            frame.reserve(sizeof(kFrameMagic) + sizeof(currentSeq) + sizeof(std::uint32_t) + payload.size() + sizeof(std::uint32_t));
+
+            AppendRaw(frame, kFrameMagic);
+            AppendRaw(frame, currentSeq);
+            AppendRaw(frame, static_cast<std::uint32_t>(payload.size()));
+            frame.insert(frame.end(), payload.begin(), payload.end());
+
+            std::uint32_t crc = Crc32::Compute(frame.data(), frame.size());
+            AppendRaw(frame, crc);
+
+            batchBuffer.insert(batchBuffer.end(), frame.begin(), frame.end());
+            ++currentSeq;
+        }
+
+        auto seekResult = file_->Seek(0, true);
+        if (!seekResult) return Result<void>::Failure(seekResult.Err());
+
+        auto writeResult = file_->Write(batchBuffer.data(), batchBuffer.size());
+        if (!writeResult || writeResult.Value() != batchBuffer.size()) {
+            return Result<void>::Failure(
+                Error{ErrorCode::IoError, "journal batch append: short write", 0});
+        }
+
+        auto flushResult = file_->FlushDurable();
+        if (!flushResult) return Result<void>::Failure(flushResult.Err());
+
+        nextSequenceNumber_ = currentSeq;
+        recordCount_ += payloads.size();
+        return Result<void>::Success();
+    }
+
     Result<void> Replay(const ReplayCallback& callback) override {
         auto seekResult = file_->Seek(0, false);
         if (!seekResult) return Result<void>::Failure(seekResult.Err());

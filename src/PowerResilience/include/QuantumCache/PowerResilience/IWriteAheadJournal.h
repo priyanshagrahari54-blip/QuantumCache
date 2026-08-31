@@ -40,6 +40,18 @@ public:
     [[nodiscard]] virtual Common::Result<std::uint64_t> Append(
         const std::vector<std::uint8_t>& payload) = 0;
 
+    // Appends a batch of records and performs a single durable flush
+    // (fsync/FlushFileBuffers) before returning success. Default
+    // implementation loops over Append for backward compatibility.
+    [[nodiscard]] virtual Common::Result<void> AppendBatch(
+        const std::vector<std::vector<std::uint8_t>>& payloads) {
+        for (const auto& payload : payloads) {
+            auto res = Append(payload);
+            if (!res) return Common::Result<void>::Failure(res.Err());
+        }
+        return Common::Result<void>::Success();
+    }
+
     // Replays every valid, fully-committed record in sequence order,
     // invoking `callback` for each. Stops (without error) at the first
     // record that fails its integrity check (CRC mismatch / truncated

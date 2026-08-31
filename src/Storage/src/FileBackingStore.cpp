@@ -192,6 +192,65 @@ public:
         return AppendRecord(key, value, /*tombstone=*/false);
     }
 
+    Result<void> PutBatch(const std::vector<BatchItem>& items) override {
+        if (items.empty()) return Result<void>::Success();
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        std::vector<std::uint8_t> batchBuffer;
+        struct PendingIndexUpdate {
+            std::string key;
+            std::uint64_t offset;
+            bool tombstone;
+        };
+        std::vector<PendingIndexUpdate> pendingUpdates;
+        pendingUpdates.reserve(items.size());
+
+        std::uint64_t currentSeq = nextSequence_;
+        std::uint64_t currentOffset = endOffset_;
+
+        for (const auto& item : items) {
+            std::uint8_t tombstoneByte = 0;
+            std::uint64_t itemOffset = currentOffset;
+
+            std::vector<std::uint8_t> frame;
+            AppendRaw(frame, kMagic);
+            AppendRaw(frame, currentSeq);
+            AppendRaw(frame, tombstoneByte);
+            AppendRaw(frame, static_cast<std::uint32_t>(item.key.size()));
+            frame.insert(frame.end(), item.key.begin(), item.key.end());
+            AppendRaw(frame, static_cast<std::uint32_t>(item.value.size()));
+            frame.insert(frame.end(), item.value.begin(), item.value.end());
+            std::uint32_t crc = Crc32::Compute(frame.data(), frame.size());
+            AppendRaw(frame, crc);
+
+            batchBuffer.insert(batchBuffer.end(), frame.begin(), frame.end());
+            pendingUpdates.push_back({item.key, itemOffset, false});
+
+            currentOffset += frame.size();
+            ++currentSeq;
+        }
+
+        auto seekResult = file_->Seek(static_cast<std::int64_t>(endOffset_), false);
+        if (!seekResult) return Result<void>::Failure(seekResult.Err());
+
+        auto writeResult = file_->Write(batchBuffer.data(), batchBuffer.size());
+        if (!writeResult || writeResult.Value() != batchBuffer.size()) {
+            return Result<void>::Failure(
+                Error{ErrorCode::IoError, "backing store batch append: short write", 0});
+        }
+
+        auto flushResult = file_->FlushDurable();
+        if (!flushResult) return flushResult;
+
+        for (const auto& update : pendingUpdates) {
+            index_[update.key] = IndexEntry{update.offset, update.tombstone};
+        }
+        endOffset_ = currentOffset;
+        nextSequence_ = currentSeq;
+
+        return Result<void>::Success();
+    }
+
     Result<void> Remove(const std::string& key) override {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = index_.find(key);
