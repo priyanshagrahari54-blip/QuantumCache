@@ -119,11 +119,17 @@ public:
         return inner_->Put(key, value);
     }
 
+    Common::Result<void> PutBatch(const std::vector<Storage::BackingStoreRecord>& records) override {
+        return inner_->PutBatch(records);
+    }
+
     Common::Result<void> Remove(const std::string& key) override { return inner_->Remove(key); }
 
     bool Contains(const std::string& key) override { return inner_->Contains(key); }
 
     std::size_t EntryCount() const noexcept override { return inner_->EntryCount(); }
+
+    std::uint64_t GetVersion(const std::string& key) override { return inner_->GetVersion(key); }
 
 private:
     std::shared_ptr<Storage::IBackingStore> inner_;

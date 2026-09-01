@@ -148,7 +148,8 @@ public:
             // Replay only if journal entry version > backing store version
             if (pendingEntry.version > backingVersion) {
                 if (pendingEntry.isInvalidate) {
-                    auto removeRes = backingStore_->Remove(key);
+                    Storage::BackingStoreRecord removeRecord{key, {}, pendingEntry.version, /*tombstone=*/true};
+                    auto removeRes = backingStore_->PutBatch({removeRecord});
                     if (!removeRes) {
                         lifecycle_.store(EngineLifecycle::RecoveryFailed);
                         return Result<void>::Failure(removeRes.Err());
@@ -755,12 +756,10 @@ private:
         WriteAdmissionGuard admissionGuard(*this);
 
         Shard& shard = ShardFor(key);
-        std::uint64_t entryVersion = 0;
         {
             std::lock_guard<std::mutex> lock(shard.mutex);
             auto it = shard.index.find(key);
             if (it != shard.index.end()) {
-                entryVersion = it->second->version;
                 if (!force && it->second->dirtyState != EntryDirtyState::Clean) {
                     return Result<void>::Failure(Error{
                         ErrorCode::UnflushedDirtyData,
@@ -786,7 +785,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(shard.mutex);
             auto it = shard.index.find(key);
-            if (it != shard.index.end() && (entryVersion == 0 || it->second->version == entryVersion)) {
+            if (it != shard.index.end() && it->second->version <= invVersion) {
                 std::size_t sizeBytes = it->second->SizeBytes();
                 if (it->second->dirtyState != EntryDirtyState::Clean) {
                     shard.dirtyBytes -= sizeBytes;

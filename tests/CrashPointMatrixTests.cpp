@@ -217,6 +217,20 @@ public:
         }
         return result;
     }
+    Common::Result<void> PutBatch(const std::vector<Storage::BackingStoreRecord>& records) override {
+        if (crashPoint_ == CrashPoint::DuringBackingStoreWrite) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError, "SIMULATED_CRASH: during backing-store write", 0});
+        }
+        auto result = inner_->PutBatch(records);
+        if (result.IsOk() && (crashPoint_ == CrashPoint::AfterBackingStoreWrite ||
+                               crashPoint_ == CrashPoint::AfterBackingStoreDurability)) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError,
+                              "SIMULATED_CRASH: after backing-store write/durability", 0});
+        }
+        return result;
+    }
     Common::Result<void> Remove(const std::string& key) override {
         if (crashPoint_ == CrashPoint::DuringBackingStoreWrite) {
             return Common::Result<void>::Failure(
@@ -233,6 +247,7 @@ public:
     }
     bool Contains(const std::string& key) override { return inner_->Contains(key); }
     std::size_t EntryCount() const noexcept override { return inner_->EntryCount(); }
+    std::uint64_t GetVersion(const std::string& key) override { return inner_->GetVersion(key); }
 
 private:
     std::shared_ptr<Storage::IBackingStore> inner_;
@@ -502,8 +517,8 @@ TEST_F(CrashPointMatrixTest, Flush_CrashDuringBackingStoreWrite_RecoversAsStillD
 }
 
 TEST_F(CrashPointMatrixTest, Flush_CrashAfterBackingStoreWrite_RecoversSafely_NoDataLoss) {
-    // Under the transactional batch durability protocol, Flush() writes directly to the backing store batch.
-    // If the backing store write completes, the data is durable in the backing store.
+    // The backing-store batch write genuinely lands durably, but crash sentinel is returned.
+    // Oracle: recovery must NOT lose data.
     auto journalFile = Storage::OpenFile(PathFor("j.dat"), Storage::OpenMode::OpenOrCreate);
     ASSERT_TRUE(journalFile.IsOk());
     auto journalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
@@ -511,18 +526,19 @@ TEST_F(CrashPointMatrixTest, Flush_CrashAfterBackingStoreWrite_RecoversSafely_No
 
     auto backingResult = Storage::OpenFileBackingStore(PathFor("s.dat"));
     ASSERT_TRUE(backingResult.IsOk());
-    std::shared_ptr<Storage::IBackingStore> backingStore = std::move(backingResult.Value());
+    auto crashStore = std::make_shared<CrashInjectingBackingStore>(std::move(backingResult.Value()));
 
     {
         auto engineResult = CoreEngine::CreateCacheEngine(
-            CoreEngine::CacheEngineOptions{}, backingStore, journal);
+            CoreEngine::CacheEngineOptions{}, crashStore, journal);
         ASSERT_TRUE(engineResult.IsOk());
         auto engine = std::move(engineResult.Value());
         ASSERT_TRUE(engine->MarkRecoveryComplete().IsOk());
 
         ASSERT_TRUE(engine->Put("fk2", Bytes("theval")).IsOk());
+        crashStore->ArmCrash(CrashPoint::AfterBackingStoreWrite);
         auto flushResult = engine->Flush("fk2");
-        EXPECT_TRUE(flushResult.IsOk());
+        EXPECT_FALSE(flushResult.IsOk());
     }
 
     auto rig = RecoverFresh("j.dat", "s.dat");

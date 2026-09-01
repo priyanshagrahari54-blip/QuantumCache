@@ -240,9 +240,19 @@ TEST_F(CacheEngineCompactionAuditTest,
             }
             return inner_->Put(key, value);
         }
+        Common::Result<void> PutBatch(const std::vector<Storage::BackingStoreRecord>& records) override {
+            for (const auto& rec : records) {
+                if (rec.key == poisonKey) {
+                    return Common::Result<void>::Failure(
+                        Common::Error{Common::ErrorCode::IoError, "simulated permanent flush failure", 0});
+                }
+            }
+            return inner_->PutBatch(records);
+        }
         Common::Result<void> Remove(const std::string& key) override { return inner_->Remove(key); }
         bool Contains(const std::string& key) override { return inner_->Contains(key); }
         std::size_t EntryCount() const noexcept override { return inner_->EntryCount(); }
+        std::uint64_t GetVersion(const std::string& key) override { return inner_->GetVersion(key); }
         std::string poisonKey;
         std::shared_ptr<Storage::IBackingStore> inner_;
     };

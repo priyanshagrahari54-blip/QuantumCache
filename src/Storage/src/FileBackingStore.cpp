@@ -46,6 +46,7 @@ using Common::Result;
 
 constexpr std::uint32_t kBatchHeaderMagic = 0x51434248u; // "QCBH"
 constexpr std::uint32_t kBatchCommitMagic = 0x51434243u; // "QCBC"
+constexpr std::uint32_t kLegacyRecordMagic = 0x51434253u; // "QCBS"
 constexpr std::uint32_t kMaxReasonableLength = 256u * 1024u * 1024u;
 
 struct IndexEntry {
@@ -77,6 +78,35 @@ public:
             std::uint64_t batchStartOffset = offset;
             std::uint32_t headerMagic = 0;
             if (!ReadExact(&headerMagic, sizeof(headerMagic))) break;
+
+            if (headerMagic == kLegacyRecordMagic) {
+                std::uint64_t sequence = 0;
+                std::uint8_t tombstone = 0;
+                std::uint32_t keyLength = 0;
+                if (!ReadExact(&sequence, sizeof(sequence)) ||
+                    !ReadExact(&tombstone, sizeof(tombstone)) ||
+                    !ReadExact(&keyLength, sizeof(keyLength))) break;
+                if (keyLength > kMaxReasonableLength) break;
+                std::vector<std::uint8_t> keyBytes(keyLength);
+                if (keyLength > 0 && !ReadExact(keyBytes.data(), keyLength)) break;
+                std::uint32_t valueLength = 0;
+                if (!ReadExact(&valueLength, sizeof(valueLength))) break;
+                if (valueLength > kMaxReasonableLength) break;
+                std::vector<std::uint8_t> valueBytes(valueLength);
+                if (valueLength > 0 && !ReadExact(valueBytes.data(), valueLength)) break;
+
+                std::string key(keyBytes.begin(), keyBytes.end());
+                std::uint64_t recOffset = batchStartOffset + sizeof(headerMagic);
+                auto it = index_.find(key);
+                if (it == index_.end() || sequence >= it->second.version) {
+                    index_[key] = IndexEntry{recOffset, tombstone != 0, sequence};
+                }
+                maxVersion = std::max(maxVersion, sequence);
+                offset = recOffset + sizeof(sequence) + sizeof(tombstone) + sizeof(keyLength) + keyLength + sizeof(valueLength) + valueLength;
+                validEnd = offset;
+                continue;
+            }
+
             if (headerMagic != kBatchHeaderMagic) break;
 
             std::uint64_t batchId = 0;

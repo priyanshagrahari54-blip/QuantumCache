@@ -39,18 +39,7 @@ public:
     // Durably persists a batch of records in a single physical append and flush.
     // The entire batch is committed atomically with a commit boundary and CRC.
     [[nodiscard]] virtual Common::Result<void> PutBatch(
-        const std::vector<BackingStoreRecord>& records) {
-        for (const auto& rec : records) {
-            if (rec.tombstone) {
-                auto res = Remove(rec.key);
-                if (!res) return res;
-            } else {
-                auto res = Put(rec.key, rec.value);
-                if (!res) return res;
-            }
-        }
-        return Common::Result<void>::Success();
-    }
+        const std::vector<BackingStoreRecord>& records) = 0;
 
     [[nodiscard]] virtual Common::Result<void> Remove(const std::string& key) = 0;
 
@@ -58,10 +47,7 @@ public:
 
     [[nodiscard]] virtual std::size_t EntryCount() const noexcept = 0;
 
-    [[nodiscard]] virtual std::uint64_t GetVersion(const std::string& key) {
-        (void)key;
-        return 0;
-    }
+    [[nodiscard]] virtual std::uint64_t GetVersion(const std::string& key) = 0;
 };
 
 // Opens (or creates) a file-backed key/value store at `dataFilePath`.
