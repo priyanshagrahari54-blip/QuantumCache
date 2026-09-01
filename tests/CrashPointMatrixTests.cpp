@@ -217,6 +217,20 @@ public:
         }
         return result;
     }
+    Common::Result<void> PutBatch(const std::vector<Storage::BackingStoreRecord>& records) override {
+        if (crashPoint_ == CrashPoint::DuringBackingStoreWrite) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError, "SIMULATED_CRASH: during backing-store write", 0});
+        }
+        auto result = inner_->PutBatch(records);
+        if (result.IsOk() && (crashPoint_ == CrashPoint::AfterBackingStoreWrite ||
+                               crashPoint_ == CrashPoint::AfterBackingStoreDurability)) {
+            return Common::Result<void>::Failure(
+                Common::Error{Common::ErrorCode::IoError,
+                              "SIMULATED_CRASH: after backing-store write/durability", 0});
+        }
+        return result;
+    }
     Common::Result<void> Remove(const std::string& key) override {
         if (crashPoint_ == CrashPoint::DuringBackingStoreWrite) {
             return Common::Result<void>::Failure(
@@ -233,6 +247,7 @@ public:
     }
     bool Contains(const std::string& key) override { return inner_->Contains(key); }
     std::size_t EntryCount() const noexcept override { return inner_->EntryCount(); }
+    std::uint64_t GetVersion(const std::string& key) override { return inner_->GetVersion(key); }
 
 private:
     std::shared_ptr<Storage::IBackingStore> inner_;
@@ -501,41 +516,27 @@ TEST_F(CrashPointMatrixTest, Flush_CrashDuringBackingStoreWrite_RecoversAsStillD
            "matching FlushComplete) must never be interpreted as Clean";
 }
 
-TEST_F(CrashPointMatrixTest, Flush_CrashAfterBackingStoreWrite_BeforeFlushComplete_RecoversSafely_NoDataLoss) {
-    // The backing-store write for the flush genuinely lands durably, but
-    // the crash happens before the FlushComplete record can be
-    // journaled. Oracle: recovery must NOT lose the data (it is durably
-    // in the backing store already) and must NOT incorrectly report a
-    // DUPLICATE or DIVERGENT state -- the entry may conservatively be
-    // recovered as still-Dirty (since FlushComplete never landed, replay
-    // cannot distinguish "flush attempted but incomplete" from "flush
-    // never attempted" -- both are treated identically and safely by
-    // re-flushing, which is idempotent for this backing store), but the
-    // actual DATA must be correct and consistent either way.
+TEST_F(CrashPointMatrixTest, Flush_CrashAfterBackingStoreWrite_RecoversSafely_NoDataLoss) {
+    // The backing-store batch write genuinely lands durably, but crash sentinel is returned.
+    // Oracle: recovery must NOT lose data.
     auto journalFile = Storage::OpenFile(PathFor("j.dat"), Storage::OpenMode::OpenOrCreate);
     ASSERT_TRUE(journalFile.IsOk());
-    auto realJournalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
-    auto crashJournal = std::make_shared<CrashInjectingJournal>(std::move(realJournalResult.Value()));
+    auto journalResult = PowerResilience::CreateWriteAheadJournal(std::move(journalFile.Value()));
+    std::shared_ptr<PowerResilience::IWriteAheadJournal> journal = std::move(journalResult.Value());
 
     auto backingResult = Storage::OpenFileBackingStore(PathFor("s.dat"));
     ASSERT_TRUE(backingResult.IsOk());
-    std::shared_ptr<Storage::IBackingStore> backingStore = std::move(backingResult.Value());
+    auto crashStore = std::make_shared<CrashInjectingBackingStore>(std::move(backingResult.Value()));
 
     {
         auto engineResult = CoreEngine::CreateCacheEngine(
-            CoreEngine::CacheEngineOptions{}, backingStore, crashJournal);
+            CoreEngine::CacheEngineOptions{}, crashStore, journal);
         ASSERT_TRUE(engineResult.IsOk());
         auto engine = std::move(engineResult.Value());
         ASSERT_TRUE(engine->MarkRecoveryComplete().IsOk());
 
         ASSERT_TRUE(engine->Put("fk2", Bytes("theval")).IsOk());
-        // Flush()'s own sequence (counting from the ArmCrash() call
-        // below, which resets the decorator's internal counter) journals
-        // FlushIntent as its 1st Append() call, then does the real
-        // backing-store Put() (allowed to succeed normally here), then
-        // journals FlushComplete as its 2nd Append() call -- crash
-        // exactly on that 2nd call.
-        crashJournal->ArmCrash(CrashPoint::AfterJournalDurability, /*atCallNumber=*/2);
+        crashStore->ArmCrash(CrashPoint::AfterBackingStoreWrite);
         auto flushResult = engine->Flush("fk2");
         EXPECT_FALSE(flushResult.IsOk());
     }
@@ -543,14 +544,8 @@ TEST_F(CrashPointMatrixTest, Flush_CrashAfterBackingStoreWrite_BeforeFlushComple
     auto rig = RecoverFresh("j.dat", "s.dat");
     ASSERT_TRUE(rig.recoverySucceeded);
     auto getResult = rig.engine->Get("fk2");
-    ASSERT_TRUE(getResult.IsOk())
-        << "REJECTED IMPOSSIBLE STATE (acknowledged-write loss): the backing-store write "
-           "genuinely completed and must be observable after recovery regardless of whether "
-           "FlushComplete was journaled";
+    ASSERT_TRUE(getResult.IsOk());
     EXPECT_EQ(ToStr(getResult.Value()), "theval");
-    // The real backing store must also directly confirm this (not just
-    // via the cache's read-through path), proving the data is durable
-    // independent of in-memory cache reconstruction.
     EXPECT_TRUE(rig.backingStore->Contains("fk2"));
 }
 

@@ -724,6 +724,17 @@ public:
     Common::Result<void> Put(const std::string& key, const std::vector<std::uint8_t>& value) override {
         return inner_->Put(key, value);
     }
+    Common::Result<void> PutBatch(const std::vector<Storage::BackingStoreRecord>& records) override {
+        for (const auto& rec : records) {
+            if (rec.key == failKey && rec.tombstone) {
+                removeCallCount++;
+                return Common::Result<void>::Failure(
+                    Common::Error{Common::ErrorCode::IoError,
+                                  "simulated backing-store I/O failure during replay Remove()", 0});
+            }
+        }
+        return inner_->PutBatch(records);
+    }
     Common::Result<void> Remove(const std::string& key) override {
         removeCallCount++;
         if (key == failKey) {
@@ -735,6 +746,7 @@ public:
     }
     bool Contains(const std::string& key) override { return inner_->Contains(key); }
     std::size_t EntryCount() const noexcept override { return inner_->EntryCount(); }
+    std::uint64_t GetVersion(const std::string& key) override { return inner_->GetVersion(key); }
 
     std::string failKey;
     int removeCallCount{0};
@@ -960,9 +972,19 @@ TEST_F(CacheEngineTest, FlushAll_DoesNotCompactJournal_WhenAFlushFails_DirtyData
             }
             return inner_->Put(key, value);
         }
+        Common::Result<void> PutBatch(const std::vector<Storage::BackingStoreRecord>& records) override {
+            for (const auto& rec : records) {
+                if (rec.key == failKey) {
+                    return Common::Result<void>::Failure(
+                        Common::Error{Common::ErrorCode::IoError, "simulated backing-store Put() failure", 0});
+                }
+            }
+            return inner_->PutBatch(records);
+        }
         Common::Result<void> Remove(const std::string& key) override { return inner_->Remove(key); }
         bool Contains(const std::string& key) override { return inner_->Contains(key); }
         std::size_t EntryCount() const noexcept override { return inner_->EntryCount(); }
+        std::uint64_t GetVersion(const std::string& key) override { return inner_->GetVersion(key); }
         std::string failKey;
         std::shared_ptr<Storage::IBackingStore> inner_;
     };

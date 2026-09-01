@@ -198,12 +198,16 @@ TEST_F(FileBackingStoreTest, CorruptedHugeLengthField_IsRejectedSafely_NoOOMAtte
     {
         std::FILE* fp = std::fopen((testDir_ / "huge_length.dat").string().c_str(), "ab");
         ASSERT_NE(fp, nullptr);
-        std::uint32_t magic = 0x51434253u; // "QCBS", matches FileBackingStore.cpp's kMagic
-        std::uint64_t sequence = 99;
+        std::uint32_t batchMagic = 0x51434248u; // "QCBH"
+        std::uint64_t batchId = 99;
+        std::uint32_t recordCount = 1;
+        std::uint64_t version = 10;
         std::uint8_t tombstone = 0;
         std::uint32_t keyLength = 3;
-        std::fwrite(&magic, sizeof(magic), 1, fp);
-        std::fwrite(&sequence, sizeof(sequence), 1, fp);
+        std::fwrite(&batchMagic, sizeof(batchMagic), 1, fp);
+        std::fwrite(&batchId, sizeof(batchId), 1, fp);
+        std::fwrite(&recordCount, sizeof(recordCount), 1, fp);
+        std::fwrite(&version, sizeof(version), 1, fp);
         std::fwrite(&tombstone, sizeof(tombstone), 1, fp);
         std::fwrite(&keyLength, sizeof(keyLength), 1, fp);
         std::fwrite("bad", 1, 3, fp);
